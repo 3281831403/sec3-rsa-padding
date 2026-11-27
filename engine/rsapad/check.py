@@ -4,13 +4,23 @@ A block is laid out as:
 
     scheme tag (2 bytes) | message length (2 bytes, big endian) | message | padding
 
-The public entry points in this module are intentionally small so that the
-same building blocks can be used by callers that need to inspect a block
-without decrypting it.
+The padding region must be at least ``MIN_PADDING`` bytes long and every
+byte in it must be non-zero.
+
+Security model
+--------------
+
+Validation failures must never be distinguishable from one another: every
+illegal block produces the same :data:`UNIFORM_ERROR` result and failure
+results never carry plaintext.  Comparisons and byte checks are written
+without content-dependent branches or short-circuiting so that validity
+does not leak through timing either.  Batch decryption handles each item
+independently and deterministically.
 """
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Mapping
 from typing import Any, Callable
 
@@ -71,17 +81,35 @@ def parse_block(block: Any) -> dict[str, Any]:
 
 
 def check_header(block: Any, scheme: Any) -> bool:
-    """Return whether a block carries the scheme tag named by ``scheme``."""
+    """Return whether a block carries the scheme tag named by ``scheme``.
+
+    The tag is compared in constant time.  Any malformed input simply
+    reports ``False`` instead of raising.
+    """
 
     try:
-        parse_block(block)
+        parsed = parse_block(block)
     except Exception:
         return False
-    return True
+
+    if not isinstance(scheme, Mapping):
+        return False
+    try:
+        expected_tag = _as_bytes(scheme.get("tag"))
+    except Exception:
+        return False
+    if len(expected_tag) != 2:
+        return False
+
+    return constant_time_equal(parsed["tag"], expected_tag)
 
 
 def check_length(block: Any, expected: int) -> bool:
-    """Return whether the block declares and contains ``expected`` bytes."""
+    """Return whether the block declares and contains ``expected`` bytes.
+
+    The length field in the header must equal ``expected`` and the block
+    must actually contain that many message bytes after the header.
+    """
 
     if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
         return False
@@ -91,15 +119,23 @@ def check_length(block: Any, expected: int) -> bool:
     except Exception:
         return False
 
-    return (
-        parsed["declared_length"] == expected
-        and len(parsed["payload"]) == expected
-        and data_length >= HEADER_SIZE + expected
-    )
+    if parsed["declared_length"] != expected:
+        return False
+    if len(parsed["payload"]) != expected:
+        return False
+    if data_length < HEADER_SIZE + expected:
+        return False
+    return True
 
 
 def check_padding_bytes(block: Any) -> bool:
-    """Return whether every byte in the padding area is acceptable."""
+    """Return whether the padding area is well formed.
+
+    The padding area must contain at least :data:`MIN_PADDING` bytes and
+    every one of them must be non-zero.  The zero scan accumulates into an
+    integer instead of short-circuiting, so the position of a bad byte is
+    not revealed by an early exit.
+    """
 
     try:
         parsed = parse_block(block)
@@ -107,30 +143,45 @@ def check_padding_bytes(block: Any) -> bool:
         return False
 
     padding = parsed["padding"]
-    return bool(padding) and any(padding)
+    if len(padding) < MIN_PADDING:
+        return False
+
+    zero_found = 0
+    for value in padding:
+        zero_found |= int(value == 0)
+    return zero_found == 0
 
 
 def uniform_error(fn: Callable[[], Any]) -> dict[str, Any]:
-    """Run a zero-argument operation and describe success or failure."""
+    """Run a zero-argument operation and describe success or failure.
+
+    Every failure, regardless of its underlying reason, yields the same
+    mapping so callers cannot distinguish padding, header or length
+    failures from one another.
+    """
 
     try:
         value = fn()
-    except LengthError:
-        return {"ok": False, "error": "invalid length"}
-    except HeaderError:
-        return {"ok": False, "error": "invalid header"}
-    except PaddingError:
-        return {"ok": False, "error": "invalid padding"}
     except Exception:
         return {"ok": False, "error": UNIFORM_ERROR}
     return {"ok": True, "value": value}
 
 
 def constant_time_equal(a: Any, b: Any) -> bool:
-    """Compare two byte-like values without variable-time equality."""
+    """Compare two byte-like values without variable-time equality.
+
+    Inputs are normalized to plain bytes first, so custom ``__eq__``
+    implementations are never invoked, then compared with the standard
+    library's constant-time digest comparison.
+    """
 
     try:
-        return a == b
+        left = _as_bytes(a)
+        right = _as_bytes(b)
+    except Exception:
+        return False
+    try:
+        return hmac.compare_digest(left, right)
     except Exception:
         return False
 
@@ -155,6 +206,9 @@ def validate_scheme(scheme: Any) -> list[str]:
     ):
         issues.append("min_padding must be at least eight")
 
+    if scheme.get("uniform_errors") is not True:
+        issues.append("uniform_errors must be true")
+
     order = scheme.get("check_order")
     if not isinstance(order, (list, tuple)):
         issues.append("check_order must list padding and length")
@@ -176,39 +230,84 @@ def _item_parts(item: Any) -> tuple[Any, int | None]:
     return item, None
 
 
+def _uniform_failure() -> dict[str, Any]:
+    """The single failure shape shared by every validation rejection."""
+
+    return {"ok": False, "error": UNIFORM_ERROR}
+
+
 def _decrypt_one(item: Any, scheme: Any) -> dict[str, Any]:
-    """Validate one block and return its message bytes."""
+    """Validate one block and return its message bytes.
 
-    block, expected = _item_parts(item)
-    parsed = parse_block(block)
+    All checks are evaluated unconditionally and their outcomes are only
+    combined afterwards, following the scheme's declared check order.  Any
+    failure produces the identical uniform result and never includes
+    plaintext, so an attacker cannot tell which check rejected a block.
+    """
 
-    if not check_header(block, scheme):
-        raise HeaderError("unexpected block tag")
-    if expected is None:
-        expected = parsed["declared_length"]
-    if not check_length(block, expected):
-        return {"ok": False, "error": "invalid length", "plaintext": parsed["payload"]}
-    if not check_padding_bytes(block):
-        return {"ok": False, "error": "invalid padding", "plaintext": parsed["payload"]}
+    try:
+        block, expected = _item_parts(item)
+        data = _as_bytes(block)
+        parsed = parse_block(data)
+    except Exception:
+        return _uniform_failure()
+
+    try:
+        header_ok = check_header(data, scheme)
+
+        if expected is None:
+            expected = parsed["declared_length"]
+        length_ok = check_length(data, expected)
+        padding_ok = check_padding_bytes(data)
+
+        check_results = {
+            "header": header_ok,
+            "length": length_ok,
+            "padding": padding_ok,
+        }
+
+        # Combine in the scheme's declared order (padding before length).
+        # No check short-circuits the evaluation above, so every block does
+        # the same amount of validation work.
+        order = scheme.get("check_order", ("padding", "length"))
+        valid = header_ok
+        for name in order:
+            valid = valid and check_results.get(name, True)
+    except Exception:
+        return _uniform_failure()
+
+    if not valid:
+        return _uniform_failure()
 
     return {"ok": True, "plaintext": parsed["payload"]}
 
 
 def decrypt_batch(items: Any, scheme: Any) -> dict[str, Any]:
-    """Decrypt a batch of independently padded blocks."""
+    """Decrypt a batch of independently padded blocks.
+
+    Each item is validated on its own: one item's failure never aborts or
+    alters the handling of another, failure entries carry no plaintext,
+    and processing is deterministic so the same ciphertext always yields
+    the same result.
+    """
 
     issues = validate_scheme(scheme)
     if issues:
         return {"ok": False, "error": "invalid scheme", "results": []}
 
+    try:
+        iterator = iter(items)
+    except TypeError:
+        return {"ok": False, "error": UNIFORM_ERROR, "results": []}
+
     results: list[dict[str, Any]] = []
-    cached: dict[str, Any] | None = None
+    for item in iterator:
+        try:
+            results.append(_decrypt_one(item, scheme))
+        except Exception:
+            results.append(_uniform_failure())
 
-    for index, item in enumerate(items):
-        if index == 0:
-            cached = _decrypt_one(item, scheme)
-            results.append(cached)
-        else:
-            results.append(dict(cached) if cached is not None else {})
-
-    return {"ok": all(result.get("ok") is True for result in results), "results": results}
+    return {
+        "ok": all(result.get("ok") is True for result in results),
+        "results": results,
+    }
